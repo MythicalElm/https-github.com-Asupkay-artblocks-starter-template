@@ -1,208 +1,279 @@
 #!/usr/bin/env python3
 """
-Realistic toy baby wrapped in a blanket — dollhouse 1:12 scale.
+Realistic baby doll in swaddled blanket — dollhouse 1:12 scale.
 
-Design fixes over previous version:
-  - Body uses filleted box (looks like a proper swaddled burrito, not flat disc)
-  - Face points UPWARD (+Z) so it's visible when viewed from above in a dollhouse
-  - All face features are shallow / flush with the head surface (no antenna ears)
-  - Ears are thin flat ovals pressed flush against the head sides
-  - Proper newborn proportions: head ≈ same width as body, chubby face
+Technique: Marching cubes on a procedurally textured Signed Distance Field (SDF).
+This is the same approach used for organic 3D models on Thingiverse/Printables:
 
-Dimensions (1:12 dollhouse scale):
-  Body  : 17 mm W × 37 mm L × 12 mm H  (filleted-edge box, sits flat)
-  Head  : 16 mm diameter sphere
-  Total : ~50 mm length
+  - Smooth-union / smooth-subtract blend ALL features (no hard CSG seams)
+  - Gaussian random noise fields simulate fabric folds and skin micro-texture
+  - Marching cubes extracts the iso-surface at high resolution
+  - Result: organic, sculpted-looking geometry with realistic cloth detail
+
+Dimensions: 1:12 dollhouse scale (~50 mm total length)
 """
 
-import os
-import cadquery as cq
-from cadquery import exporters
-from OCP.gp import gp_GTrsf, gp_Mat
-from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from skimage import measure
+import struct, os, time
+
+t0 = time.time()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRID SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+VOXEL = 0.32          # mm per voxel — higher resolution than typical CAD export
+
+xs = np.arange(-15.5, 15.5, VOXEL)
+ys = np.arange(-27.0, 49.0, VOXEL)
+zs = np.arange(-3.0,  28.0, VOXEL)
+X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+print(f"Grid {X.shape}  ({X.size/1e6:.1f}M voxels)")
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SDF PRIMITIVES  (all vectorised over the full grid)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _scale_xyz(shape_val, sx, sy, sz):
-    mat = gp_Mat(sx, 0, 0,
-                  0, sy, 0,
-                  0, 0, sz)
-    t = gp_GTrsf()
-    t.SetVectorialPart(mat)
-    builder = BRepBuilderAPI_GTransform(shape_val.wrapped, t, True)
-    return cq.Solid(builder.Shape())
+def sphere(cx, cy, cz, r):
+    return np.sqrt((X-cx)**2 + (Y-cy)**2 + (Z-cz)**2) - r
 
+def ellipsoid(cx, cy, cz, ax, ay, az):
+    """
+    Scaled-sphere ellipsoid.  Not unit-gradient, but stable and correct
+    sign everywhere (negative inside, zero on surface, positive outside).
+    Distances are scaled by the smallest half-axis so blend-radii k are
+    roughly in mm units, which is all we need for organic smooth ops.
+    """
+    r = np.sqrt(((X-cx)/ax)**2 + ((Y-cy)/ay)**2 + ((Z-cz)/az)**2)
+    scale = min(ax, ay, az)
+    return (r - 1.0) * scale
 
-def ellipsoid(ax, ay, az):
-    unit = cq.Workplane("XY").sphere(1.0).val()
-    return _scale_xyz(unit, ax, ay, az)
+def rounded_box(cx, cy, cz, hx, hy, hz, r):
+    """Signed distance to rounded box (half-extents hx,hy,hz, corner radius r)."""
+    qx = np.abs(X-cx) - hx + r
+    qy = np.abs(Y-cy) - hy + r
+    qz = np.abs(Z-cz) - hz + r
+    return (np.sqrt(np.maximum(qx,0)**2 + np.maximum(qy,0)**2 + np.maximum(qz,0)**2)
+            + np.minimum(np.maximum(qx, np.maximum(qy, qz)), 0) - r)
 
+def capsule(ax, ay, az, bx, by, bz, r):
+    """Capsule (thick line segment a→b, radius r)."""
+    abx, aby, abz = bx-ax, by-ay, bz-az
+    t = np.clip(((X-ax)*abx+(Y-ay)*aby+(Z-az)*abz) /
+                (abx**2+aby**2+abz**2+1e-12), 0, 1)
+    px = X-ax - t*abx;  py = Y-ay - t*aby;  pz = Z-az - t*abz
+    return np.sqrt(px**2+py**2+pz**2) - r
 
-def E(ax, ay, az, tx=0.0, ty=0.0, tz=0.0):
-    """Place an ellipsoid solid as a Workplane."""
-    return cq.Workplane("XY").add(ellipsoid(ax, ay, az)).translate((tx, ty, tz))
+def smin(a, b, k=2.5):
+    """Smooth boolean union (k = blend radius in mm). Quilez 2013 formula."""
+    h = np.clip(0.5 + 0.5*(b-a)/k, 0, 1)
+    return b + h*(a-b) - k*h*(1-h)   # mix(b,a,h) — picks min, NOT mix(a,b,h)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 1. SWADDLED BODY  — filleted rectangular box
-#    Looks like a cloth-wrapped swaddle, not a flat disc.
-#    Sitting flat at z = 0.
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Box: 17 W × 37 L × 12 H, all edges filleted 2.8 mm for soft blanket feel
-body = (
-    cq.Workplane("XY")
-    .box(17, 37, 12)
-    .edges().fillet(2.8)
-)
-# Box is centred at origin (z = -6 to +6); lift so bottom rests at z = 0
-body = body.translate((0, 0, 6))
-
-# ── Blanket chest-fold ridge ──────────────────────────────────────────────────
-# Semi-oval ridge at y = +10, running across width → turned-down blanket edge
-fold = (
-    cq.Workplane("XZ")
-    .workplane(offset=10)
-    .moveTo(0, 12.0)          # top surface of body
-    .ellipseArc(7.0, 1.6, 0, 180, startAtCurrent=False)
-    .close()
-    .extrude(0.8, both=True)
-)
-body = body.union(fold)
-
-# ── Shallow blanket wrinkle grooves ──────────────────────────────────────────
-# Two thin cuts on the top surface, parallel to the long axis, simulating
-# fabric folds where the blanket is pulled tight.
-for xs in (+1, -1):
-    wrinkle = (
-        cq.Workplane("XY")
-        .box(0.6, 28, 1.0)
-        .translate((xs * 4.5, 0, 12.3))   # sits just above top surface
-    )
-    body = body.cut(wrinkle)
+def ssub(a, b, k=1.8):
+    """Smooth boolean subtraction of b from a."""
+    return -smin(-a, b, k)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 2. NECK  — small ellipsoid blending body end into head
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# PROCEDURAL TEXTURE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-neck = E(4.8, 4.5, 5.0, ty=21.0, tz=9.5)
+def gnoise(sigma_vox, amplitude, seed):
+    """
+    Gaussian-smoothed white noise — produces band-limited organic bumps.
+    sigma_vox: smoothing kernel in voxels (controls bump wavelength).
+    amplitude: peak-to-peak displacement in mm.
+    """
+    rng = np.random.default_rng(seed)
+    raw = rng.standard_normal(X.shape).astype(np.float32)
+    smoothed = gaussian_filter(raw, sigma=sigma_vox)
+    # Normalise to [-1, 1] then scale
+    mx = np.max(np.abs(smoothed)) + 1e-12
+    return (smoothed / mx) * amplitude
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 3. HEAD  — sphere, radius 8 mm
-#    Centre at (0, 28, 10).  Face points UPWARD (+Z), slightly tilted toward
-#    +Y (the head end), so the face is visible from above in a dollhouse.
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. SWADDLED BODY
+#    Rounded box: 17 W × 37 L × 12 H mm, sitting on z = 0.
+#    Centre at (0, 0, 6).
+# ─────────────────────────────────────────────────────────────────────────────
 
-HR  = 8.0
-HCX, HCY, HCZ = 0.0, 28.0, 10.0
+d_body = rounded_box(0, 0, 6.0,  hx=8.0, hy=18.0, hz=5.8,  r=2.5)
 
-head = cq.Workplane("XY").sphere(HR).translate((HCX, HCY, HCZ))
+# ── Fabric texture ────────────────────────────────────────────────────────────
+# Three scales of Gaussian noise simulate:
+#   large   (~8 vox ≈ 2.6 mm)  = major cloth folds
+#   medium  (~3 vox ≈ 1.0 mm)  = secondary wrinkles
+#   fine    (~1.5 vox ≈ 0.5 mm) = weave micro-texture
+
+n_large  = gnoise(sigma_vox=8,   amplitude=0.60, seed=1)
+n_medium = gnoise(sigma_vox=3,   amplitude=0.22, seed=2)
+n_fine   = gnoise(sigma_vox=1.5, amplitude=0.09, seed=3)
+
+# Directional fold bias: fabric tends to fold along the short axis (X),
+# so amplify noise variation in X by modulating with a slow sine in Y.
+fold_bias = 1.0 + 0.45 * np.sin(Y * 2*np.pi / 11.0)   # ~11 mm period
+side_bias = 1.0 + 0.35 * (np.abs(X) / 8.0)             # edges wrinkle more
+
+# Top of blanket is pulled tight → smooth it there
+tight_top = np.clip(1.0 - (Z - 9.5) / 3.0, 0.0, 1.0)  # 0 at very top, 1 below
+
+fabric = (n_large + n_medium + n_fine) * fold_bias * side_bias * tight_top
+
+# Only displace where we are near the body surface (|d| < 4 mm)
+body_weight = np.clip(1.0 - np.abs(d_body) / 4.0, 0, 1)
+d_body = d_body + fabric * body_weight
+
+# ── Chest fold ridge ──────────────────────────────────────────────────────────
+# Raised blanket edge near y = +10, modelled as a capsule.
+d_fold_ridge = capsule(-8, 10, 12.2,  8, 10, 12.2,  r=1.5)
+d_body = smin(d_body, d_fold_ridge, k=1.2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. NECK
+#    Capsule bridging body end (y ≈ +18) to head start (y ≈ +20).
+# ─────────────────────────────────────────────────────────────────────────────
+
+d_neck = capsule(0, 17.5, 8.5,  0, 22.0, 9.5,  r=4.2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. HEAD
+#    Sphere r = 8 mm, centre (0, 27, 10).
+#    Face tilted UPWARD (+Z) and slightly toward +Y so features are
+#    visible from above when the baby is lying in the dollhouse.
+# ─────────────────────────────────────────────────────────────────────────────
+
+HR = 8.0
+HCX, HCY, HCZ = 0.0, 27.0, 10.0
+
+d_head = sphere(HCX, HCY, HCZ, HR)
+
+# Very subtle skin micro-texture (σ ≈ 0.8 mm, amplitude 0.07 mm)
+skin_n = gnoise(sigma_vox=2.5, amplitude=0.07, seed=7)
+head_weight = np.clip(1.0 - np.abs(d_head) / 3.0, 0, 1)
+d_head = d_head + skin_n * head_weight
 
 # ── Chubby cheeks ─────────────────────────────────────────────────────────────
-# Rounded bumps on the lower-front of the head, adding baby chubbiness.
-# Positioned so they blend smoothly with the sphere.
-for xs in (+1, -1):
-    head = head.union(
-        E(3.2, 2.5, 2.8, tx=xs * 4.0, ty=HCY + 4.5, tz=HCZ - 2.0)
-    )
+for xs_ in (+1, -1):
+    d_head = smin(d_head, ellipsoid(xs_*4.0, HCY+5.0, HCZ-2.0, 3.5, 2.8, 3.0), k=2.0)
 
-# Chin: slight rounded protrusion below the mouth
-head = head.union(E(2.8, 2.0, 1.8, ty=HCY + 6.0, tz=HCZ - 4.5))
+# Chin
+d_head = smin(d_head, ellipsoid(0, HCY+6.2, HCZ-4.5, 2.8, 2.2, 1.8), k=1.8)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. FACE FEATURES
-#    Face points UP (+Z) and slightly toward +Y.
-#    All feature depths are conservative: unions ≤ 1.5 mm proud,
-#    cuts ≤ 0.8 mm deep, so nothing looks like an antenna.
-#
-#    Face surface (top of sphere) ≈ (0, HCY, HCZ + HR) = (0, 28, 18)
-#    Tilting face toward +Y shifts features to ~(0, 31, 17)
-# ═════════════════════════════════════════════════════════════════════════════
+#    Face normal ≈ (0, +0.38, +0.92) → face points mostly up, tilted toward +Y.
+#    Face surface centre: (0, HCY + 0.38*HR, HCZ + 0.92*HR) ≈ (0, 30, 17.4)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# All face features use a local origin anchored to the tilted face surface
-FX  = HCX                  # centre X
-FY  = HCY + 3.5            # face tilted toward +Y end
-FZ  = HCZ + HR - 1.8       # face sits near top of sphere (inset 1.8mm)
+# Convenience: face reference point
+FX = HCX
+FY = HCY + 3.0     # tilted-forward face centre Y
+FZ = HCZ + HR - 1.5  # near top of sphere
 
-# ── Eye sockets (subtle oval recesses) ───────────────────────────────────────
-EYE_SEP = 2.6              # half-separation between eyes
-for xs in (+1, -1):
-    head = head.cut(
-        E(2.4, 0.8, 1.8, tx=xs * EYE_SEP, ty=FY - 0.5, tz=FZ + 1.5)
-    )
+# ── Eye sockets (shallow oval depressions) ────────────────────────────────────
+for xs_ in (+1, -1):
+    d_sock = ellipsoid(xs_*2.7, FY-0.5, FZ+1.3,  ax=2.5, ay=0.9, az=1.8)
+    d_head = ssub(d_head, d_sock, k=1.2)
 
-# ── Eyelids (thin raised arc over each socket) ───────────────────────────────
-for xs in (+1, -1):
-    head = head.union(
-        E(2.3, 0.7, 0.9, tx=xs * EYE_SEP, ty=FY - 0.2, tz=FZ + 1.8)
-    )
+# ── Eyelids (thin raised arcs) ────────────────────────────────────────────────
+for xs_ in (+1, -1):
+    d_lid = ellipsoid(xs_*2.7, FY-0.2, FZ+1.6,  ax=2.3, ay=0.7, az=0.9)
+    d_head = smin(d_head, d_lid, k=1.0)
 
-# ── Nose ──────────────────────────────────────────────────────────────────────
-# Small rounded button nose — newborn noses are tiny and upturned
-head = head.union(E(1.8, 1.3, 1.4, tx=FX, ty=FY + 1.0, tz=FZ - 0.2))
+# ── Nose bridge (slight ridge between brows) ──────────────────────────────────
+d_head = smin(d_head, ellipsoid(0, FY+0.0, FZ+0.6, 0.9, 0.65, 1.9), k=1.2)
 
-# Nostril hints (very shallow cuts)
-for xs in (+1, -1):
-    head = head.cut(
-        E(0.7, 0.6, 0.7, tx=xs * 0.85, ty=FY + 1.5, tz=FZ - 0.6)
-    )
+# ── Nose tip (small button nose, typical newborn) ─────────────────────────────
+d_head = smin(d_head, ellipsoid(0, FY+1.2, FZ-0.4, 1.7, 1.3, 1.5), k=1.3)
 
-# ── Lips ──────────────────────────────────────────────────────────────────────
-# Upper lip: two small lobes (cupid's bow), lower lip: one wider lobe
-for xs in (+1, -1):
-    head = head.union(
-        E(1.2, 0.8, 0.8, tx=xs * 1.0, ty=FY + 1.0, tz=FZ - 1.8)
-    )
-head = head.union(E(2.4, 0.9, 0.9, tx=FX, ty=FY + 0.9, tz=FZ - 2.8))
+# Nostril hints
+for xs_ in (+1, -1):
+    d_nost = ellipsoid(xs_*0.9, FY+1.7, FZ-0.9,  ax=0.75, ay=0.75, az=0.7)
+    d_head = ssub(d_head, d_nost, k=0.8)
 
-# Mouth crease line
-head = head.cut(
-    cq.Workplane("XY").box(4.8, 0.7, 0.45)
-    .translate((FX, FY + 1.4, FZ - 2.3))
-)
+# ── Upper lip (cupid's bow) ───────────────────────────────────────────────────
+for xs_ in (+1, -1):
+    d_head = smin(d_head, ellipsoid(xs_*1.1, FY+1.1, FZ-2.0, 1.3, 0.85, 0.85), k=1.0)
 
-# ── Ears ──────────────────────────────────────────────────────────────────────
-# FLAT against the sides of the head — just 0.6 mm proud so they read as ears
-# without looking like alien antennae.
-# Positioned at the equator of the sphere, X sides.
-for xs in (+1, -1):
-    # Ear: thin flat ellipsoid pressed to the side of the head
-    ear_tx = xs * (HR - 0.6)       # nearly at sphere surface, X side
-    head = head.union(
-        E(0.7, 1.6, 2.4, tx=ear_tx, ty=HCY - 1.0, tz=HCZ)
-    )
-    # Concha (ear canal depression) — cut a very shallow recess
-    head = head.cut(
-        E(0.5, 0.9, 1.4, tx=xs * (HR + 0.1), ty=HCY - 1.0, tz=HCZ)
-    )
-    # Earlobe: small rounded bump at the bottom of the ear
-    head = head.union(
-        E(0.6, 1.0, 1.0, tx=xs * (HR - 0.8), ty=HCY - 0.5, tz=HCZ - 2.2)
-    )
+# ── Lower lip ─────────────────────────────────────────────────────────────────
+d_head = smin(d_head, ellipsoid(0, FY+1.05, FZ-3.1, 2.6, 0.95, 0.95), k=1.0)
+
+# ── Mouth crease (thin groove) ────────────────────────────────────────────────
+d_mouth_cut = ellipsoid(0, FY+1.45, FZ-2.55,  ax=3.0, ay=0.45, az=0.35)
+d_head = ssub(d_head, d_mouth_cut, k=0.7)
+
+# ── Philtrum ──────────────────────────────────────────────────────────────────
+d_head = ssub(d_head, ellipsoid(0, FY+1.25, FZ-1.4, 0.55, 0.5, 1.3), k=0.8)
+
+# ── Ears (flat, flush with head sides) ───────────────────────────────────────
+for xs_ in (+1, -1):
+    # Pinna: thin oval barely proud of the sphere
+    d_pinna = ellipsoid(xs_*(HR-0.5), HCY-1.5, HCZ,  ax=0.85, ay=1.5, az=2.2)
+    d_head = smin(d_head, d_pinna, k=1.0)
+    # Concha depression
+    d_concha = ellipsoid(xs_*(HR+0.1), HCY-1.5, HCZ,  ax=0.6, ay=0.9, az=1.3)
+    d_head = ssub(d_head, d_concha, k=0.7)
+    # Earlobe
+    d_head = smin(d_head, ellipsoid(xs_*(HR-0.8), HCY-1.0, HCZ-2.3, 0.7, 0.95, 1.0), k=1.0)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 5. ASSEMBLE
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. ASSEMBLE FULL FIELD
+# ─────────────────────────────────────────────────────────────────────────────
 
-baby = body.union(neck).union(head)
+d_head_neck = smin(d_head, d_neck, k=2.5)
+d_full = smin(d_head_neck, d_body, k=2.0)
+
+print(f"SDF built  ({time.time()-t0:.1f}s)")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 6. EXPORT
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. MARCHING CUBES  (iso-surface at d = 0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+t1 = time.time()
+verts, faces, normals, _ = measure.marching_cubes(d_full, level=0.0, spacing=(VOXEL, VOXEL, VOXEL))
+
+# Shift vertices to world coordinates
+verts[:, 0] += xs[0]
+verts[:, 1] += ys[0]
+verts[:, 2] += zs[0]
+
+print(f"Marching cubes: {len(verts):,} vertices, {len(faces):,} triangles  ({time.time()-t1:.1f}s)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. EXPORT BINARY STL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_binary_stl(path, verts, faces, normals):
+    header = b"Baby doll in blanket - SDF marching cubes - 1:12 dollhouse scale"
+    header = header[:80].ljust(80, b"\x00")
+    with open(path, "wb") as f:
+        f.write(header)
+        f.write(struct.pack("<I", len(faces)))
+        for i, face in enumerate(faces):
+            n = normals[i] if i < len(normals) else (0.0, 0.0, 1.0)
+            f.write(struct.pack("<fff", *n))
+            for vi in face:
+                f.write(struct.pack("<fff", *verts[vi]))
+            f.write(struct.pack("<H", 0))
 
 out = "baby_doll.stl"
-exporters.export(baby, out, exportType="STL", tolerance=0.04, angularTolerance=0.08)
-
-size_kb = os.path.getsize(out) / 1024
-print(f"Generated '{out}'  ({size_kb:.1f} KB)")
-print("Body    : filleted box 17×37×12 mm — proper swaddle profile")
-print("Head    : sphere ∅16 mm, face pointing UP (visible from above)")
-print("Features: eye sockets, eyelids, button nose, nostrils, cupid-bow lips,")
-print("          mouth crease, flat-flush ears, chubby cheeks, chin")
-print("Scale   : 1:12 dollhouse  (~50 mm total length)")
+write_binary_stl(out, verts, faces, normals)
+size_mb = os.path.getsize(out) / 1024 / 1024
+print(f"Written '{out}'  ({size_mb:.1f} MB)")
+print(f"Total time: {time.time()-t0:.1f}s")
+print()
+print("Technique : Marching cubes on textured SDF")
+print("Texture   : Multi-scale Gaussian noise fields (cloth folds + skin)")
+print("Features  : Smooth-union/subtract (zero seams) — cheeks, eye sockets,")
+print("            eyelids, nose bridge, button nose, nostrils, cupid's bow")
+print("            lips, mouth crease, philtrum, flush ears + earlobes")
+print("Scale     : 1:12 dollhouse  (~50 mm total length)")
