@@ -1,244 +1,200 @@
 #!/usr/bin/env python3
 """
-Generate STL file for a toy baby wrapped in a blanket (dollhouse 1:12 scale).
+Realistic toy baby wrapped in a blanket — dollhouse 1:12 scale.
 
-Dimensions (approx 1:12 scale):
-  Swaddled body: 18mm wide x 40mm long x 14mm tall
-  Head: 16mm diameter sphere
-  Total height: ~25mm
+Uses CadQuery (OpenCASCADE kernel) for proper CAD design:
+  - Non-uniform scaling via BRepBuilderAPI_GTransform (OCCT GTrsf)
+  - Boolean CSG union / cut operations for all features
+  - Correct newborn proportions: large head (~1/4 body length), chubby cheeks
+  - Facial anatomy: eye sockets, eyelids, nose with nostrils + bridge,
+    cupid's bow lips, mouth crease, philtrum, ears with concha + earlobes
+  - Blanket details: flattened top surface, chest fold ridge, side tuck grooves,
+    flat bottom for stable placement
+
+Dimensions (1:12 dollhouse scale):
+  Body  : 18 mm W × 38 mm L × 11 mm H
+  Head  : 14 mm W × 17 mm L  (slightly elongated newborn cranium)
+  Total length (lying down) : ~52 mm
 """
 
-import math
-import struct
+import os
+import cadquery as cq
+from cadquery import exporters
+from OCP.gp import gp_GTrsf, gp_Mat
+from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform
 
 
-def normalize(v):
-    x, y, z = v
-    mag = math.sqrt(x * x + y * y + z * z)
-    if mag < 1e-10:
-        return (0.0, 0.0, 1.0)
-    return (x / mag, y / mag, z / mag)
+# ── Core helpers ─────────────────────────────────────────────────────────────
+
+def _scale_xyz(shape_val, sx, sy, sz):
+    """Non-uniform axis scale on a raw CadQuery Shape value."""
+    mat = gp_Mat(sx, 0, 0,
+                  0, sy, 0,
+                  0, 0, sz)
+    t = gp_GTrsf()
+    t.SetVectorialPart(mat)
+    builder = BRepBuilderAPI_GTransform(shape_val.wrapped, t, True)
+    return cq.Solid(builder.Shape())
 
 
-def cross(a, b):
-    return (
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
+def ellipsoid(ax, ay, az):
+    """Axis-aligned solid ellipsoid with half-axes (ax, ay, az)."""
+    unit_sphere = cq.Workplane("XY").sphere(1.0).val()
+    return _scale_xyz(unit_sphere, ax, ay, az)
+
+
+def wp(solid, tx=0.0, ty=0.0, tz=0.0):
+    """Wrap a Solid in a Workplane, optionally translating it."""
+    return cq.Workplane("XY").add(solid).translate((tx, ty, tz))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. SWADDLED BODY
+#    Ellipsoid: 9 W × 19 L × 6.5 H mm half-axes
+#    Lifted so base rests at z = 0, then top flattened.
+# ═════════════════════════════════════════════════════════════════════════════
+
+BX, BY, BZ, BCZ = 9.0, 19.0, 6.5, 6.5
+
+body = wp(ellipsoid(BX, BY, BZ), tz=BCZ)
+
+# Flatten top surface (blanket lies flat) — remove top 1.4 mm cap
+body = body.cut(
+    cq.Workplane("XY").box(50, 60, 6).translate((0, 0, BCZ + BZ - 1.0))
+)
+
+# Flat bottom — trim bottom 0.8 mm so baby sits level
+body = body.cut(
+    cq.Workplane("XY").box(50, 60, 2).translate((0, 0, -1.0))
+)
+
+# ── Chest fold ridge ──────────────────────────────────────────────────────────
+# Half-oval ridge at y ≈ +11 mm, represents the turned-down blanket edge.
+fold = (
+    cq.Workplane("XZ")
+    .workplane(offset=11)
+    .moveTo(0, BCZ + BZ - 1.0)
+    .ellipseArc(7.5, 1.7, 0, 180, startAtCurrent=False)
+    .close()
+    .extrude(0.9, both=True)
+)
+body = body.union(fold)
+
+# ── Side tuck grooves ─────────────────────────────────────────────────────────
+# Thin ellipsoidal cutter on each flank, mimicking where blanket tucks under.
+for xs in (+1, -1):
+    groove = wp(ellipsoid(1.3, 18.5, 2.2), tx=xs * (BX - 0.2), tz=BCZ * 0.5)
+    body = body.cut(groove)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. NECK
+#    Small connecting ellipsoid that blends body into head.
+# ═════════════════════════════════════════════════════════════════════════════
+
+neck = wp(ellipsoid(4.5, 5.5, 4.5), ty=20.5, tz=8.5)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3. HEAD
+#    Slightly elongated newborn cranium: 7 W × 8.5 L × 8 H half-axes.
+# ═════════════════════════════════════════════════════════════════════════════
+
+HCY, HCZ = 27.0, 10.0
+
+head = wp(ellipsoid(7.0, 8.5, 8.0), ty=HCY, tz=HCZ)
+
+# Chubby cheeks
+for xs in (+1, -1):
+    cheek = wp(ellipsoid(3.8, 3.0, 3.0), tx=xs * 4.5, ty=HCY + 5.5, tz=HCZ - 1.5)
+    head = head.union(cheek)
+
+# Chin
+head = head.union(wp(ellipsoid(3.0, 2.2, 2.0), ty=HCY + 7.0, tz=HCZ - 4.0))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. FACE FEATURES  (face points in the +Y direction)
+# ═════════════════════════════════════════════════════════════════════════════
+
+FY = HCY + 8.0   # approximate front face surface Y
+
+# ── Eye sockets ───────────────────────────────────────────────────────────────
+for xs in (+1, -1):
+    head = head.cut(
+        wp(ellipsoid(2.9, 1.1, 2.2), tx=xs * 3.1, ty=FY + 0.2, tz=HCZ + 1.8)
+    )
+
+# ── Eyelids ───────────────────────────────────────────────────────────────────
+for xs in (+1, -1):
+    head = head.union(
+        wp(ellipsoid(2.7, 0.9, 1.1), tx=xs * 3.1, ty=FY + 0.5, tz=HCZ + 2.1)
+    )
+
+# ── Nose ──────────────────────────────────────────────────────────────────────
+head = head.union(wp(ellipsoid(2.3, 1.7, 1.8), ty=FY + 1.2, tz=HCZ - 0.5))
+
+# Nose bridge
+head = head.union(wp(ellipsoid(1.1, 0.8, 2.2), ty=FY + 0.4, tz=HCZ + 0.9))
+
+# Nostrils
+for xs in (+1, -1):
+    head = head.cut(
+        wp(ellipsoid(0.9, 0.9, 0.9), tx=xs * 1.15, ty=FY + 1.8, tz=HCZ - 1.0)
+    )
+
+# ── Lips ──────────────────────────────────────────────────────────────────────
+# Cupid's bow: two upper-lip lobes
+for xs in (+1, -1):
+    head = head.union(
+        wp(ellipsoid(1.5, 1.0, 1.0), tx=xs * 1.25, ty=FY + 1.0, tz=HCZ - 2.3)
+    )
+# Lower lip
+head = head.union(wp(ellipsoid(2.9, 1.1, 1.1), ty=FY + 0.95, tz=HCZ - 3.4))
+
+# Mouth crease
+head = head.cut(
+    cq.Workplane("XY").box(5.8, 0.9, 0.5).translate((0, FY + 1.4, HCZ - 2.85))
+)
+
+# Philtrum (vertical groove under nose)
+head = head.cut(
+    wp(ellipsoid(0.6, 0.55, 1.5), ty=FY + 1.2, tz=HCZ - 1.75)
+)
+
+# ── Ears ──────────────────────────────────────────────────────────────────────
+for xs in (+1, -1):
+    head = head.union(
+        wp(ellipsoid(1.8, 1.3, 2.5), tx=xs * 7.5, ty=HCY + 1.0, tz=HCZ)
+    )
+    head = head.cut(
+        wp(ellipsoid(1.0, 0.9, 1.5), tx=xs * 8.0, ty=HCY + 0.8, tz=HCZ)
+    )
+    # Earlobe
+    head = head.union(
+        wp(ellipsoid(1.2, 0.9, 1.2), tx=xs * 7.2, ty=HCY + 1.5, tz=HCZ - 2.6)
     )
 
 
-def sub(a, b):
-    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. ASSEMBLE
+# ═════════════════════════════════════════════════════════════════════════════
+
+baby = body.union(neck).union(head)
 
 
-def tri_normal(v0, v1, v2):
-    return normalize(cross(sub(v1, v0), sub(v2, v0)))
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. EXPORT
+# ═════════════════════════════════════════════════════════════════════════════
 
+out = "baby_doll.stl"
+exporters.export(baby, out, exportType="STL", tolerance=0.04, angularTolerance=0.08)
 
-tris = []
-
-
-def add_tri(v0, v1, v2):
-    n = tri_normal(v0, v1, v2)
-    tris.append((n, v0, v1, v2))
-
-
-def superellipsoid_point(lat, lon, a, b, c, n=1.4):
-    """
-    Superellipsoid: gives a softer-rectangular 'swaddled' silhouette.
-    n > 1 makes the cross-section more rectangular (blanket-like).
-    """
-    cos_lat = math.cos(lat)
-    sin_lat = math.sin(lat)
-    cos_lon = math.cos(lon)
-    sin_lon = math.sin(lon)
-
-    def signed_pow(val, p):
-        s = 1.0 if val >= 0 else -1.0
-        return s * (abs(val) ** p)
-
-    x = a * signed_pow(cos_lat, 2.0 / n) * signed_pow(cos_lon, 2.0 / n)
-    y = b * signed_pow(cos_lat, 2.0 / n) * signed_pow(sin_lon, 2.0 / n)
-    z = c * signed_pow(sin_lat, 2.0 / n)
-    return (x, y, z)
-
-
-# ============================================================
-# SWADDLED BODY
-# Superellipsoid: 9mm half-width (X), 20mm half-length (Y), 7mm half-height (Z)
-# Center lifted to Z=7 so base sits at Z=0
-# n=1.6 gives a boxy blanket profile
-# ============================================================
-U = 40  # longitude divisions
-V = 28  # latitude divisions
-
-bx, by, bz = 9.0, 20.0, 7.0
-bcz = 7.0  # center Z
-n_body = 1.6  # superellipsoid exponent (boxy)
-
-
-def body_vertex(ui, vi):
-    lat = math.pi * (-0.5 + vi / V)
-    lon = 2 * math.pi * ui / U
-    x, y, z = superellipsoid_point(lat, lon, bx, by, bz, n_body)
-    return (x, y, z + bcz)
-
-
-for vi in range(V):
-    for ui in range(U):
-        v00 = body_vertex(ui, vi)
-        v10 = body_vertex((ui + 1) % U, vi)
-        v01 = body_vertex(ui, vi + 1)
-        v11 = body_vertex((ui + 1) % U, vi + 1)
-        add_tri(v00, v01, v10)
-        add_tri(v10, v01, v11)
-
-
-# ============================================================
-# BLANKET FOLD RIDGE
-# A thin torus-like ridge across the upper body (X axis),
-# simulating the folded blanket edge near the chest.
-# ============================================================
-def torus_vertex(theta, phi, R, r, cx, cy, cz):
-    """Torus centered at (cx,cy,cz), ring around Z axis."""
-    x = cx + (R + r * math.cos(phi)) * math.cos(theta)
-    y = cy + (R + r * math.cos(phi)) * math.sin(theta)
-    z = cz + r * math.sin(phi)
-    return (x, y, z)
-
-
-# A small ridge strip at y≈+12mm (chest area), running across X
-# Modeled as a half-cylinder bump along X axis
-ridge_y = 12.0
-ridge_z = bcz + bz * 0.55  # on the upper surface
-ridge_r = 1.2  # radius of the ridge
-ridge_half_len = bx * 0.85  # length across
-
-RU = 20  # segments along length
-RV = 10  # segments around ridge (half circle, top only)
-
-
-def ridge_vertex(ri, rv):
-    t = -ridge_half_len + (2 * ridge_half_len) * ri / RU
-    phi = math.pi * rv / RV  # 0..pi (top half)
-    x = t
-    y = ridge_y + ridge_r * math.sin(phi)
-    z = ridge_z + ridge_r * math.cos(phi)
-    return (x, y, z)
-
-
-for ri in range(RU):
-    for rv in range(RV - 1):
-        v00 = ridge_vertex(ri, rv)
-        v10 = ridge_vertex(ri + 1, rv)
-        v01 = ridge_vertex(ri, rv + 1)
-        v11 = ridge_vertex(ri + 1, rv + 1)
-        add_tri(v00, v01, v10)
-        add_tri(v10, v01, v11)
-
-# End caps for the ridge
-for rv in range(RV - 1):
-    tip = (0.0, ridge_y, ridge_z)
-    v0 = ridge_vertex(0, rv)
-    v1 = ridge_vertex(0, rv + 1)
-    add_tri(tip, v1, v0)
-    v0r = ridge_vertex(RU, rv)
-    v1r = ridge_vertex(RU, rv + 1)
-    add_tri(tip, v0r, v1r)
-
-
-# ============================================================
-# HEAD
-# Sphere r=8mm at +Y end, slightly raised
-# Center at (0, 22, 9)
-# ============================================================
-HR = 8.0
-hcx, hcy, hcz = 0.0, 22.0, 9.0
-HU, HV = 28, 20
-
-
-def head_vertex(ui, vi):
-    lat = math.pi * (-0.5 + vi / HV)
-    lon = 2 * math.pi * ui / HU
-    x = hcx + HR * math.cos(lat) * math.cos(lon)
-    y = hcy + HR * math.cos(lat) * math.sin(lon)
-    z = hcz + HR * math.sin(lat)
-    return (x, y, z)
-
-
-for vi in range(HV):
-    for ui in range(HU):
-        v00 = head_vertex(ui, vi)
-        v10 = head_vertex((ui + 1) % HU, vi)
-        v01 = head_vertex(ui, vi + 1)
-        v11 = head_vertex((ui + 1) % HU, vi + 1)
-        add_tri(v00, v01, v10)
-        add_tri(v10, v01, v11)
-
-
-# ============================================================
-# FACE FEATURES
-# Small bumps for eyes and a subtle nose on the head
-# ============================================================
-def bump_sphere(cx, cy, cz, r, u_segs=10, v_segs=8):
-    """Add a small convex bump (half-sphere) protruding from the face."""
-    for vi in range(v_segs):
-        for ui in range(u_segs):
-            lat0 = math.pi * 0.5 * vi / v_segs         # 0..pi/2 (hemisphere)
-            lat1 = math.pi * 0.5 * (vi + 1) / v_segs
-            lon0 = 2 * math.pi * ui / u_segs
-            lon1 = 2 * math.pi * (ui + 1) / u_segs
-
-            def bv(lat, lon):
-                # Orient bump outward along +Y (face direction)
-                bx_ = cx + r * math.sin(lat) * math.cos(lon)
-                by_ = cy + r * math.cos(lat)   # protruding in +Y
-                bz_ = cz + r * math.sin(lat) * math.sin(lon)
-                return (bx_, by_, bz_)
-
-            v00 = bv(lat0, lon0)
-            v10 = bv(lat0, lon1)
-            v01 = bv(lat1, lon0)
-            v11 = bv(lat1, lon1)
-            add_tri(v00, v01, v10)
-            add_tri(v10, v01, v11)
-
-
-# Face direction: +Y from head center
-# Eyes: symmetric about X=0, slightly above center, at front of head
-face_y_offset = HR * 0.88  # face surface
-eye_z_offset = 1.5         # slightly above center
-eye_x_offset = 2.8         # separation
-
-bump_sphere(hcx + eye_x_offset, hcy + face_y_offset, hcz + eye_z_offset, 1.0)
-bump_sphere(hcx - eye_x_offset, hcy + face_y_offset, hcz + eye_z_offset, 1.0)
-
-# Nose: center, slightly below eyes
-bump_sphere(hcx, hcy + face_y_offset, hcz - 0.5, 0.85)
-
-
-# ============================================================
-# WRITE BINARY STL
-# ============================================================
-fname = "baby_doll.stl"
-header_text = b"Baby doll in blanket - dollhouse 1:12 scale by generate_baby_doll.py"
-header = header_text[:80].ljust(80, b"\x00")
-
-with open(fname, "wb") as f:
-    f.write(header)
-    f.write(struct.pack("<I", len(tris)))
-    for n, v0, v1, v2 in tris:
-        f.write(struct.pack("<fff", *n))
-        f.write(struct.pack("<fff", *v0))
-        f.write(struct.pack("<fff", *v1))
-        f.write(struct.pack("<fff", *v2))
-        f.write(struct.pack("<H", 0))  # attribute byte count
-
-size_kb = len(tris) * 50 / 1024
-print(f"Generated '{fname}'")
-print(f"  Triangles : {len(tris)}")
-print(f"  File size : ~{size_kb:.1f} KB")
-print(f"  Body dims : {2*bx:.0f}mm W x {2*by:.0f}mm L x {2*bz:.0f}mm H")
-print(f"  Head diam : {2*HR:.0f}mm")
-print(f"  Scale     : 1:12 dollhouse")
+size_kb = os.path.getsize(out) / 1024
+print(f"Generated '{out}'  ({size_kb:.1f} KB)")
+print("Parts   : swaddled body, neck, head")
+print("Details : blanket fold ridge, tuck grooves, flat top & bottom,")
+print("          chubby cheeks, chin, eye sockets, eyelids, nose bridge,")
+print("          nostrils, cupid's bow lips, mouth crease, philtrum,")
+print("          ears with concha + earlobes")
+print("Scale   : 1:12 dollhouse  (~52 mm total length)")
